@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"text/template"
@@ -15,6 +18,8 @@ import (
 
 	"github.com/cheggaaa/pb/v3"
 	"github.com/davidbyttow/govips/v2/vips"
+
+	_ "net/http/pprof"
 )
 
 // assets
@@ -51,6 +56,7 @@ var optIgnoreVideos = false
 var optDryRun = false
 var optVerbose = false
 var optCleanUp = false
+var optMemoryUse = false
 
 // this function parses command-line arguments
 func parseArgs() (inputDirectory string, outputDirectory string) {
@@ -58,7 +64,9 @@ func parseArgs() (inputDirectory string, outputDirectory string) {
 	optIgnoreVideosPtr := flag.Bool("i", false, "Ignore video files")
 	optCleanUpPtr := flag.Bool("c", false, "Clean up - delete stale media files from output directory")
 	optDryRunPtr := flag.Bool("d", false, "Dry run - don't make changes, only explain what would be done")
-	optVerbosePtr := flag.Bool("v", false, "Verbose - explain what's happening all the time")
+	optVerbosePtr := flag.Bool("v", false, "Verbose - print debugging information to stderr")
+	optProfile := flag.Bool("p", false, "Run Go pprof profiling service for debugging")
+	optMemory := flag.Bool("m", false, "Minimize memory usage")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTION]... DIRECTORY\n\n", os.Args[0])
@@ -90,6 +98,16 @@ func parseArgs() (inputDirectory string, outputDirectory string) {
 	if isEmptyDir(flag.Args()[0]) {
 		fmt.Fprintf(os.Stderr, "%s: Input directory is empty: %s\n", os.Args[0], flag.Args()[0])
 		os.Exit(1)
+	}
+
+	if *optMemory {
+		optMemoryUse = true
+	}
+
+	if *optProfile {
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
 	}
 
 	if *optDryRunPtr {
@@ -222,6 +240,22 @@ func isMediaFile(filename string) bool {
 	return false
 }
 
+// Checks if given directory entry is symbolic link to a directory
+func isSymlinkDir(directory string, entry os.FileInfo) (is bool) {
+	if entry.Mode()&os.ModeSymlink != 0 {
+		realPath, err := filepath.EvalSymlinks(filepath.Join(directory, entry.Name()))
+		checkError(err)
+
+		fileinfo, err := os.Lstat(realPath)
+		checkError(err)
+
+		if fileinfo.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 func recurseDirectory(thisDirectory string, relativeDirectory string) (root directory) {
 	root.name = filepath.Base(thisDirectory)
 	asIsStat, _ := os.Stat(thisDirectory)
@@ -236,7 +270,7 @@ func recurseDirectory(thisDirectory string, relativeDirectory string) (root dire
 	}
 
 	for _, entry := range list {
-		if entry.IsDir() {
+		if entry.IsDir() || isSymlinkDir(thisDirectory, entry) {
 			if !isEmptyDir(filepath.Join(thisDirectory, entry.Name())) {
 				root.subdirectories = append(root.subdirectories, recurseDirectory(filepath.Join(thisDirectory, entry.Name()), filepath.Join(relativeDirectory, root.name)))
 			}
@@ -699,9 +733,15 @@ func resizeFullsizeImage(source string, destination string) {
 func fullsizeImageWorker(wg *sync.WaitGroup, imageJobs chan job, progressBar *pb.ProgressBar) {
 	defer wg.Done()
 	for job := range imageJobs {
+		if optVerbose {
+			fmt.Fprintf(os.Stderr, "Creating full size image of %s\n", job.source)
+		}
 		resizeFullsizeImage(job.source, job.destination)
 		if !optDryRun {
 			progressBar.Increment()
+			if optMemoryUse {
+				runtime.GC()
+			}
 		}
 	}
 }
@@ -709,6 +749,9 @@ func fullsizeImageWorker(wg *sync.WaitGroup, imageJobs chan job, progressBar *pb
 func fullsizeVideoWorker(wg *sync.WaitGroup, videoJobs chan job, progressBar *pb.ProgressBar) {
 	defer wg.Done()
 	for job := range videoJobs {
+		if optVerbose {
+			fmt.Fprintf(os.Stderr, "Creating full size video of %s\n", job.source)
+		}
 		resizeFullsizeVideo(job.source, job.destination)
 		if !optDryRun {
 			progressBar.Increment()
@@ -745,6 +788,9 @@ func fullsizeCopyFile(source string, destination string, fullsizeImageJobs chan 
 func thumbnailImageWorker(wg *sync.WaitGroup, thumbnailImageJobs chan job) {
 	defer wg.Done()
 	for job := range thumbnailImageJobs {
+		if optVerbose {
+			fmt.Fprintf(os.Stderr, "Creating thumbnail image of %s\n", job.source)
+		}
 		resizeThumbnailImage(job.source, job.destination)
 	}
 }
@@ -752,6 +798,9 @@ func thumbnailImageWorker(wg *sync.WaitGroup, thumbnailImageJobs chan job) {
 func thumbnailVideoWorker(wg *sync.WaitGroup, thumbnailVideoJobs chan job) {
 	defer wg.Done()
 	for job := range thumbnailVideoJobs {
+		if optVerbose {
+			fmt.Fprintf(os.Stderr, "Creating thumbnail video of %s\n", job.source)
+		}
 		resizeThumbnailVideo(job.source, job.destination)
 	}
 }
@@ -903,15 +952,13 @@ func main() {
 			progressBar = pb.StartNew(changes)
 			if optVerbose {
 				vips.LoggingSettings(nil, vips.LogLevelDebug)
-			} else {
-				vips.LoggingSettings(nil, vips.LogLevelMessage)
-			}
-			if optVerbose {
 				vips.Startup(&vips.Config{
-					ReportLeaks: true})
+					CacheTrace:   false,
+					CollectStats: false,
+					ReportLeaks:  true})
 			} else {
-				vips.Startup(&vips.Config{
-					ReportLeaks: false})
+				vips.LoggingSettings(nil, vips.LogLevelError)
+				vips.Startup(nil)
 			}
 			defer vips.Shutdown()
 		}
